@@ -322,8 +322,8 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
                 
                 self.states[request_id].start += input_tensor.shape[1]
                 
-                # Renvoyer les logits
-                return outputs.logits.cpu().numpy()
+                # Convertir d'abord en float32 avant numpy pour éviter l'erreur "Got unsupported ScalarType BFloat16"
+                return outputs.logits.to(torch.float32).cpu().numpy()
             
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
@@ -349,7 +349,8 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
                     self.states[request_id] = make_prompt_state(input_tensor, self.model)
                     self.states[request_id].start = reduced_context
                     
-                    return outputs.logits.cpu().numpy()
+                    # Convertir également ici en float32 avant numpy
+                    return outputs.logits.to(torch.float32).cpu().numpy()
                 else:
                     raise
         
