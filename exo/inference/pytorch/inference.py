@@ -81,93 +81,86 @@ def build_transformer(model_path: Path, shard: Shard, model_size="8B", device=No
         print(f"Model {model_id} already loaded, reusing instance")
         return existing_model
     
-    # Vérifier l'espace disque et les permissions
-    try:
-        if model_path.exists():
-            stat_info = os.stat(model_path)
-            print(f"File permissions: {stat_info.st_mode}, size: {stat_info.st_size} bytes")
-            
-            # Vérifier l'espace disque disponible
-            disk_stats = os.statvfs(model_path.parent)
-            free_space = disk_stats.f_frsize * disk_stats.f_bavail
-            print(f"Available disk space: {free_space / (1024**3):.2f} GB")
-    except Exception as e:
-        print(f"Error checking file stats: {e}")
+    # Analyser la taille du modèle en fonction du nom
+    if "1b" in shard.model_id.lower():
+        model_size_mb = 1000
+    elif "3b" in shard.model_id.lower():
+        model_size_mb = 3000
+    elif "8b" in shard.model_id.lower():
+        model_size_mb = 8000
+    elif "70b" in shard.model_id.lower():
+        model_size_mb = 70000
+    else:
+        # Taille par défaut si on ne peut pas déterminer
+        model_size_mb = 3000
+        
+    # Estimer les besoins en mémoire GPU (règle approximative: 2x la taille du modèle en FP16)
+    estimated_gpu_memory = model_size_mb * 2 / 1000  # En Go pour FP16
+    print(f"Estimated GPU memory needed for model: {estimated_gpu_memory:.2f} GB (model size: {model_size})")
     
     try:
         # Libérer la mémoire GPU et forcer le garbage collector
         torch.cuda.empty_cache()
         gc.collect()
         
+        # Déterminer le périphérique à utiliser
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Vérifier la mémoire GPU disponible
+        free_mem = 0
+        total_mem = 0
         if torch.cuda.is_available():
-            # Afficher les statistiques de mémoire GPU
             total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
             free_mem = total_mem - allocated_mem
-            print(f"GPU memory before loading: Total {total_mem:.2f} GB, Used: {allocated_mem:.2f} GB, Free: {free_mem:.2f} GB")
+            print(f"GPU memory: Total {total_mem:.2f} GB, Used: {allocated_mem:.2f} GB, Free: {free_mem:.2f} GB")
         
-        # Déterminer le device à utiliser
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"Using device: {device}")
-        
-        # Options d'optimisation mémoire basées sur la taille du modèle
+        # Options de quantification en fonction de la mémoire disponible
         use_8bit = False
         use_4bit = False
         
+        # Stratégie de chargement basée sur la mémoire disponible
         if device == "cuda" and torch.cuda.is_available():
-            if model_size in ["1B", "3B"]:
-                if free_mem < 5.0:
-                    print("Memory limited for this model size. Using 8-bit quantization.")
+            # Si le modèle est trop grand pour la mémoire disponible, utiliser la quantification
+            if free_mem < estimated_gpu_memory * 1.2:  # Ajouter une marge de 20%
+                # Adaptative memory saving strategy
+                if model_size in ["1B", "3B"]:
+                    # 8-bit est suffisant pour les petits modèles si la mémoire est limitée
                     use_8bit = True
-            elif free_mem < 10.0:
-                print("Memory limited for this model size. Using 4-bit quantization.")
-                use_4bit = True
+                    print(f"Using 8-bit quantization for {model_size} model due to memory constraints")
+                else:
+                    # 4-bit pour les modèles plus grands
+                    use_4bit = True
+                    print(f"Using 4-bit quantization for {model_size} model due to memory constraints")
         
-        # Vérifier si les bibliothèques nécessaires sont installées
+        # Vérifier les bibliothèques nécessaires
         has_accelerate = False
         has_bitsandbytes = False
         
         try:
             import accelerate
             has_accelerate = True
-            print("Accelerate is available, using it for efficient loading")
         except ImportError:
-            print("Accelerate not found. Loading model with standard settings.")
+            print("Warning: Accelerate not found. This may impact performance.")
         
         try:
             import bitsandbytes as bnb
             has_bitsandbytes = True
-            print("BitsAndBytes is available, quantization options enabled")
         except ImportError:
-            use_8bit = False
-            use_4bit = False
-            print("BitsAndBytes not found. Quantization options disabled.")
+            if use_8bit or use_4bit:
+                print("Warning: BitsAndBytes not found but quantization requested. Disabling quantization.")
+                use_8bit = False
+                use_4bit = False
         
-        # Configuration des options de chargement optimisées
-        loading_options = {}
+        # Configuration des options de chargement
+        loading_options = {
+            "device_map": "cpu" if device == "cpu" else "auto",
+            "low_cpu_mem_usage": True,
+            "torch_dtype": torch.float16 if device == "cuda" else torch.float32
+        }
         
-        # Utilisez toujours float16 qui est universellement supporté par les GPU CUDA
-        # Évitez complètement BFloat16 qui cause l'erreur
-        if device == "cuda":
-            loading_options["torch_dtype"] = torch.float16
-            print("Using Float16 for model loading")
-        else:
-            loading_options["torch_dtype"] = torch.float32
-            print("Using Float32 for model loading on CPU")
-        
-        # Configurer l'environnement pour éviter la fragmentation mémoire
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            
-        # Options basées sur les bibliothèques disponibles
-        if has_accelerate:
-            if device == "cpu":
-                loading_options["device_map"] = "cpu"
-            else:
-                loading_options["device_map"] = "auto" if use_8bit or use_4bit else device
-                loading_options["low_cpu_mem_usage"] = True
-        
-        # Options de quantification si BitsAndBytes est disponible
+        # Options de quantification
         if has_bitsandbytes:
             if use_8bit:
                 loading_options["load_in_8bit"] = True
@@ -179,27 +172,25 @@ def build_transformer(model_path: Path, shard: Shard, model_size="8B", device=No
                 loading_options["bnb_4bit_quant_type"] = "nf4"
                 print("Loading model in 4-bit precision")
         
-        # Charger le modèle avec HuggingFace Transformers
+        # Configurer l'environnement pour éviter la fragmentation mémoire
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
         print(f"Loading model from {model_path} with options: {loading_options}")
+        
+        # Charger le modèle
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             **loading_options
         )
         
-        print(f"Model loaded successfully")
-        
-        # Vérifier l'état de la mémoire après chargement
+        # Vérifier la mémoire après chargement
         if torch.cuda.is_available():
             allocated_mem_after = torch.cuda.memory_allocated(0) / (1024**3)
             free_mem_after = total_mem - allocated_mem_after
             print(f"GPU memory after loading: Used: {allocated_mem_after:.2f} GB, Free: {free_mem_after:.2f} GB")
         
-        model.eval()  # Passer en mode évaluation
-        
-        # Si on n'est pas sur CUDA et qu'on n'a pas utilisé device_map, déplacer le modèle manuellement
-        if device == "cuda" and not has_accelerate and torch.cuda.is_available():
-            print("Moving model to CUDA manually")
-            model = model.to("cuda")
+        # Passer en mode évaluation pour inférence
+        model.eval()
         
         # Charger le tokenizer
         tokenizer_path = str(model_path if model_path.is_dir() else model_path.parent)
@@ -329,40 +320,146 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
         await asyncio.get_running_loop().run_in_executor(self.executor, save_wrapper)
     
     async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[dict] = None) -> Tuple[np.ndarray, Optional[dict]]:
-        """Exécute l'inférence sur les données d'entrée"""
+        """Exécute l'inférence sur les données d'entrée avec une gestion optimisée de la mémoire"""
         await self.ensure_shard(shard)
         
         def infer_wrapper():
+            # Déterminer la taille du modèle pour obtenir les limites de contexte appropriées
+            model_size = "3B"  # Taille par défaut
+            if "1b" in shard.model_id.lower():
+                model_size = "1B"
+            elif "3b" in shard.model_id.lower():
+                model_size = "3B"
+            elif "8b" in shard.model_id.lower():
+                model_size = "8B"
+            elif "70b" in shard.model_id.lower():
+                model_size = "70B"
+            
+            # Obtenir la taille maximale du contexte pour ce modèle
+            max_context = MODEL_PARAMS.get(model_size, {}).get("max_context", 2048)
+            actual_context = max_context
+            
+            # Pour les petits modèles, utiliser une taille de contexte plus petite initialement pour économiser la VRAM
+            if model_size in ["1B", "3B"]:
+                # Commencer avec un contexte plus petit pour économiser la mémoire
+                actual_context = min(2048, max_context)
+            
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            # Afficher les stats mémoire avant inférence
+            if torch.cuda.is_available():
+                before_mem = torch.cuda.memory_allocated() / (1024**3)
+                before_max = torch.cuda.max_memory_allocated() / (1024**3)
+                free_mem = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / (1024**3)
+                print(f"GPU memory before inference: {before_mem:.2f} GB (peak: {before_max:.2f} GB), free: {free_mem:.2f} GB")
+            
             # Convertir numpy en torch tensor avec le type explicite pour les IDs de tokens
-            # S'assurer que les données d'entrée sont traitées comme des entiers longs (Long)
-            # pour l'opération d'embedding
-            input_tensor = torch.tensor(input_data, dtype=torch.long).to(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
+            input_tensor = torch.tensor(input_data, dtype=torch.long)
+            
+            # Limiter la taille du contexte au maximum supporté par le modèle
+            if input_tensor.shape[1] > actual_context:
+                print(f"Input size {input_tensor.shape[1]} exceeds context size {actual_context}, truncating to last {actual_context} tokens")
+                input_tensor = input_tensor[:, -actual_context:]
+            
+            # Déplacer le tensor sur le bon périphérique seulement après avoir redimensionné
+            input_tensor = input_tensor.to(device)
             
             # Récupérer l'état de la requête
             state = self.poll_state(input_tensor, request_id)
             
+            # Calcul de l'utilisation estimée de mémoire pour le KV cache
+            # Modèle simplifié : chaque token dans le contexte utilise approximativement:
+            # - 2 (K+V) * nombre de couches * taille de la tête * nombre de têtes bytes
+            token_memory_approx = {
+                "1B": 0.0002,  # 200 KB par token environ
+                "3B": 0.0005,  # 500 KB par token environ
+                "8B": 0.0012,  # 1.2 MB par token environ
+                "70B": 0.0095,  # 9.5 MB par token environ
+            }
+            
+            # Mémoire estimée pour le KV cache
+            kv_cache_memory_gb = input_tensor.shape[1] * token_memory_approx.get(model_size, 0.0005)
+            print(f"Estimated KV cache memory usage: {kv_cache_memory_gb:.2f} GB for {input_tensor.shape[1]} tokens")
+            
             # Paramètres d'inférence
-            kwargs = {}
+            kwargs = {
+                "use_cache": True  # Activer le cache KV pour accélérer la génération
+            }
+            
+            # N'utiliser le KV cache précédent que si les tokens d'entrée sont peu nombreux
+            # Cela évite l'accumulation excessive de mémoire
             if "past_key_values" in state and state["past_key_values"] is not None:
-                kwargs["past_key_values"] = state["past_key_values"]
-                kwargs["use_cache"] = True
+                # Si l'entrée est petite (ajout de quelques tokens seulement), utiliser le cache précédent
+                if input_tensor.shape[1] < 8:  # Par exemple, pour une génération token par token
+                    kwargs["past_key_values"] = state["past_key_values"]
+                else:
+                    # Sinon, on recommence avec un nouveau contexte complet
+                    print("Input too large, not using previous KV cache")
+                    # Ne pas utiliser le cache précédent
             
-            # Exécuter le modèle
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_tensor,
-                    **kwargs
-                )
+            try:
+                # Exécuter le modèle avec garde-fou pour la mémoire
+                with torch.no_grad():
+                    # Configuration pour optimiser l'inférence
+                    with torch.cuda.amp.autocast(enabled=device == "cuda"):
+                        outputs = self.model(
+                            input_ids=input_tensor,
+                            **kwargs
+                        )
+                
+                # Mettre à jour l'état du contexte pour les futures générations
+                # Ne stocker le passé que si le modèle est en mode génération (peu de tokens en entrée)
+                if input_tensor.shape[1] < 8:
+                    if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
+                        self.states[request_id].cache["past_key_values"] = outputs.past_key_values
+                else:
+                    # Pour les longues entrées, on ne stocke pas le cache KV pour économiser la mémoire
+                    if request_id in self.states:
+                        self.states[request_id].cache["past_key_values"] = None
+                
+                self.states[request_id].start += input_tensor.shape[1]
+                
+                # Vérifier l'utilisation mémoire après inférence
+                if torch.cuda.is_available():
+                    after_mem = torch.cuda.memory_allocated() / (1024**3)
+                    after_max = torch.cuda.max_memory_allocated() / (1024**3)
+                    print(f"GPU memory after inference: {after_mem:.2f} GB (peak: {after_max:.2f} GB)")
+                    print(f"Memory delta: {after_mem - before_mem:.2f} GB")
+                
+                # Renvoyer les logits
+                return outputs.logits.cpu().numpy()
             
-            # Mettre à jour l'état
-            if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
-                self.states[request_id].cache["past_key_values"] = outputs.past_key_values
-            self.states[request_id].start += input_tensor.shape[1]
-            
-            # Renvoyer les logits
-            return outputs.logits.cpu().numpy()
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    print(f"CUDA OOM error: {str(e)}")
+                    print(f"Input shape: {input_tensor.shape}")
+                    
+                    # Libérer la mémoire
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    # Réinitialiser l'état pour cette requête et supprimer le KV cache
+                    if request_id in self.states:
+                        del self.states[request_id]
+                    
+                    # Essayer avec un contexte plus petit sans KV cache
+                    # Réduction progressive: essayer d'abord avec 25% de réduction
+                    reduced_context = max(128, int(input_tensor.shape[1] * 0.75))
+                    print(f"Retrying with reduced context: {reduced_context} tokens")
+                    
+                    input_tensor = input_tensor[:, -reduced_context:].to(device)
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast(enabled=device == "cuda"):
+                            outputs = self.model(input_ids=input_tensor, use_cache=False)
+                    
+                    # Recréer un état propre avec un cache vide
+                    self.states[request_id] = make_prompt_state(input_tensor, self.model)
+                    self.states[request_id].start = reduced_context
+                    
+                    return outputs.logits.cpu().numpy()
+                else:
+                    raise
         
         output_data = await asyncio.get_running_loop().run_in_executor(self.executor, infer_wrapper)
         return output_data, inference_state
