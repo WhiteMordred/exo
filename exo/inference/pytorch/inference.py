@@ -42,11 +42,16 @@ def build_transformer(model_path: Path, shard: Shard, model_size="8B", device=No
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Options de chargement de base
+    # Options de chargement pour une répartition optimale des ressources
     loading_options = {
-        "device_map": device,
-        "torch_dtype": torch.float16 if device == "cuda" else torch.float32
+        "device_map": "auto",       # Toujours utiliser "auto" pour permettre la répartition
+        "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+        "low_cpu_mem_usage": True
     }
+    
+    # Pour les très grands modèles, ajouter l'option d'offload
+    if "70b" in model_path.name.lower():
+        loading_options["offload_folder"] = "offload_folder"
     
     print(f"Loading model from {model_path} with options: {loading_options}")
     
