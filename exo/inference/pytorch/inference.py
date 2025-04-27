@@ -11,17 +11,102 @@ from exo.inference.inference_engine import InferenceEngine
 from exo.inference.shard import Shard
 from exo.download.shard_download import ShardDownloader
 from exo import DEBUG
+import re
+
+# Singleton pour gérer les modèles chargés
+class ModelManager:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ModelManager, cls).__new__(cls)
+            cls._instance.model = None
+            cls._instance.tokenizer = None
+            cls._instance.current_shard = None
+        return cls._instance
+    
+    def get_model_and_tokenizer(self, shard: Shard, model_path: Path):
+        """Renvoie le modèle et le tokenizer, ne les charge qu'une seule fois pour un shard donné"""
+        if self.current_shard == shard and self.model is not None and self.tokenizer is not None:
+            if DEBUG >= 2: print(f"Model {shard.model_id} is already loaded, reusing")
+            return self.model, self.tokenizer
+        
+        # Libérer la mémoire de l'ancien modèle si nécessaire
+        if self.model is not None:
+            if torch.cuda.is_available():
+                try:
+                    self.model = self.model.to("cpu")
+                except Exception as e:
+                    print(f"Error moving model to CPU: {e}")
+            self.model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Charger le nouveau modèle de façon agnostique
+        print(f"Loading model: {shard.model_id}")
+        
+        self.model, self.tokenizer, _ = build_transformer(model_path=model_path)
+        
+        # Mettre à jour le shard actuel
+        self.current_shard = shard
+        print(f"Successfully loaded model and tokenizer for {shard.model_id}")
+        
+        return self.model, self.tokenizer
 
 # Paramètres par défaut
 TEMPERATURE = float(os.getenv("TEMPERATURE", 0.85))
 TOP_K = 25
 TOP_P = 0.9
-MODEL_PARAMS = {
-    "1B": {"max_context": 8192},
-    "3B": {"max_context": 8192},
-    "8B": {"max_context": 8192},
-    "70B": {"max_context": 8192},
-}
+
+def get_model_params(model_path=None, model_size_gb=None):
+    """
+    Détermine dynamiquement les paramètres du modèle basés sur sa taille estimée
+    au lieu d'utiliser des tailles prédéfinies hardcodées.
+    
+    Args:
+        model_path (str): Chemin vers le modèle
+        model_size_gb (float): Taille estimée du modèle en GB
+        
+    Returns:
+        dict: Paramètres adaptés à la taille du modèle
+    """
+    # Valeurs par défaut sécuritaires pour tout modèle
+    params = {
+        "max_context": 8192,  # Valeur par défaut
+        "rope_scaling": None  # Pas de scaling RoPE par défaut
+    }
+    
+    # Si nous ne pouvons pas estimer la taille, retourner les paramètres par défaut
+    if model_size_gb is None:
+        return params
+    
+    # Ajuster les paramètres en fonction de la taille du modèle
+    # Les seuils sont approximatifs et peuvent être ajustés selon les besoins
+    if model_size_gb <= 2.0:  # ~1B parameters
+        params["max_context"] = 4096
+    elif model_size_gb <= 6.0:  # ~3B parameters
+        params["max_context"] = 4096
+    elif model_size_gb <= 16.0:  # ~8B parameters
+        params["max_context"] = 8192
+    else:  # Grands modèles (>16GB)
+        params["max_context"] = 8192
+        # Activer le scaling RoPE pour les très grands modèles si nécessaire
+        if model_size_gb > 32.0:
+            params["rope_scaling"] = {"type": "dynamic", "factor": 2.0}
+    
+    # Vérifier si le nom du modèle contient des informations sur le contexte maximal
+    if model_path:
+        # Détecter les mentions de taille de contexte dans le nom du modèle
+        context_indicators = re.findall(r'(\d+)k', os.path.basename(model_path).lower())
+        if context_indicators:
+            try:
+                # Prendre le plus grand nombre mentionné suivi de 'k'
+                largest_context = max(int(c) * 1024 for c in context_indicators)
+                params["max_context"] = largest_context
+            except ValueError:
+                pass
+    
+    return params
 
 class PromptState:
     """État pour gérer le contexte du modèle pendant l'inférence"""
@@ -33,45 +118,71 @@ def make_prompt_state(inputs, model):
     """Crée un nouvel état pour un prompt"""
     return PromptState(0, {})
 
-def build_transformer(model_path: Path, shard: Shard, model_size="8B", device=None):
+def build_transformer(model_name_or_path, model_class, config_class, tokenizer_class):
     """
-    Charge un modèle PyTorch à partir du chemin spécifié
+    Construit un modèle transformeur avec le tokenizer associé.
+    Cette version est complètement agnostique à la taille du modèle.
     """
-    print(f"Loading model from {model_path}, exists: {model_path.exists()}, is directory: {model_path.is_dir() if model_path.exists() else 'N/A'}")
+    tokenizer = tokenizer_class.from_pretrained(model_name_or_path)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Estimer la taille du modèle dynamiquement
+    model_size_gb = estimate_model_size(model_name_or_path)
     
-    # Options de chargement pour une répartition optimale des ressources
-    loading_options = {
-        "device_map": "auto",       # Toujours utiliser "auto" pour permettre la répartition
-        "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
-        "low_cpu_mem_usage": True
-    }
+    # Obtenir les paramètres dynamiquement en fonction de la taille estimée
+    model_params = get_model_params(model_name_or_path, model_size_gb)
     
-    # Pour les très grands modèles, ajouter l'option d'offload
-    if "70b" in model_path.name.lower():
-        loading_options["offload_folder"] = "offload_folder"
+    config = config_class.from_pretrained(
+        model_name_or_path,
+        rope_scaling=model_params.get("rope_scaling"),
+    )
     
-    print(f"Loading model from {model_path} with options: {loading_options}")
+    # Définir la valeur de max_context
+    max_context = model_params.get("max_context", 4096)
     
-    try:
-        # Charger le modèle
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **loading_options
-        )
+    # Log des informations détectées pour aider au débogage
+    logging.info(f"Modèle détecté de taille approximative: {model_size_gb:.2f} GB")
+    logging.info(f"Paramètres utilisés: max_context={max_context}, rope_scaling={model_params.get('rope_scaling')}")
+    
+    # Charger le modèle avec les paramètres déterminés dynamiquement
+    model = model_class.from_pretrained(
+        model_name_or_path,
+        config=config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    
+    return model, tokenizer
+
+def estimate_model_size(model_path: Path) -> float:
+    """
+    Estime la taille du modèle en GB en analysant les fichiers de poids
+    ou le répertoire du modèle.
+    """
+    if not model_path.exists():
+        return 0
         
-        # Passer en mode évaluation pour inférence
-        model.eval()
-        
-        return model
+    size_bytes = 0
     
-    except Exception as e:
-        print(f"Error in build_transformer: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
+    # Si c'est un fichier unique (comme un checkpoint)
+    if model_path.is_file():
+        return model_path.stat().st_size / 1e9  # Convertir en GB
+    
+    # Si c'est un répertoire (structure HF)
+    for file_path in model_path.glob("**/*.bin"):
+        size_bytes += file_path.stat().st_size
+    
+    # Vérifier s'il y a des safetensors (format alternatif de HF)
+    safetensor_size = 0
+    for file_path in model_path.glob("**/*.safetensors"):
+        safetensor_size += file_path.stat().st_size
+    
+    # Utiliser le plus grand des deux formats (bin ou safetensors)
+    size_bytes = max(size_bytes, safetensor_size)
+    
+    # Convertir en GB
+    return size_bytes / 1e9
 
 _executor = ThreadPoolExecutor(max_workers=1)  # singleton pour que PyTorch s'exécute toujours sur le même thread
 class PyTorchDynamicShardInferenceEngine(InferenceEngine):
@@ -299,29 +410,8 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             print(f"Model path received: {model_path}")
             
             if self.shard != shard:
-                # Libérer la mémoire de l'ancien modèle si nécessaire
-                if self.model is not None:
-                    if torch.cuda.is_available():
-                        # Déplacer l'ancien modèle vers CPU puis le supprimer
-                        try:
-                            self.model = self.model.to("cpu")
-                        except Exception as e:
-                            print(f"Error moving model to CPU: {e}")
-                    self.model = None
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                
-                parameters = "1B" if "1b" in shard.model_id.lower() else "3B" if "3b" in shard.model_id.lower() else "8B" if "8b" in shard.model_id.lower() else "70B"
-                print(f"Selected model parameters: {parameters}")
-                
-                # Charger le nouveau modèle
-                loop = asyncio.get_running_loop()
-                self.model = await loop.run_in_executor(self.executor, build_transformer, model_path, shard, parameters)
-                
-                # Charger le tokenizer
-                tokenizer_path = str((model_path if model_path.is_dir() else model_path.parent))
-                print(f"Loading tokenizer from: {tokenizer_path}")
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                model_manager = ModelManager()
+                self.model, self.tokenizer = model_manager.get_model_and_tokenizer(shard, model_path)
                 
                 # Mettre à jour le shard actuel
                 self.shard = shard
