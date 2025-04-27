@@ -212,13 +212,36 @@ class GRPCPeerHandle(PeerHandle):
     other_data = {}
     for k, v in inference_state.items():
       if isinstance(v, mx.array):
+        # Convertir BFloat16 en float32 avant la sérialisation
         np_array = np.array(v)
+        if str(np_array.dtype) == 'bfloat16':
+          np_array = np_array.astype(np.float32)
+        tensor_data = node_service_pb2.Tensor(tensor_data=np_array.tobytes(), shape=list(np_array.shape), dtype=str(np_array.dtype))
+        proto_inference_state.tensor_data[k].CopyFrom(tensor_data)
+      # Ajout de la gestion des tenseurs PyTorch
+      elif hasattr(v, 'dtype') and hasattr(v, 'numpy') and str(v.dtype) == 'torch.bfloat16':
+        # Convertir les tenseurs PyTorch BFloat16 en float32
+        np_array = v.float().detach().numpy()  # Convertit BFloat16 en float32
         tensor_data = node_service_pb2.Tensor(tensor_data=np_array.tobytes(), shape=list(np_array.shape), dtype=str(np_array.dtype))
         proto_inference_state.tensor_data[k].CopyFrom(tensor_data)
       elif isinstance(v, list) and all(isinstance(item, mx.array) for item in v):
         tensor_list = node_service_pb2.TensorList()
         for tensor in v:
           np_array = np.array(tensor)
+          # Convertir BFloat16 en float32 avant la sérialisation
+          if str(np_array.dtype) == 'bfloat16':
+            np_array = np_array.astype(np.float32)
+          tensor_data = node_service_pb2.Tensor(tensor_data=np_array.tobytes(), shape=list(np_array.shape), dtype=str(np_array.dtype))
+          tensor_list.tensors.append(tensor_data)
+        proto_inference_state.tensor_list_data[k].CopyFrom(tensor_list)
+      # Ajout de la gestion des listes de tenseurs PyTorch
+      elif isinstance(v, list) and len(v) > 0 and hasattr(v[0], 'dtype') and hasattr(v[0], 'numpy'):
+        tensor_list = node_service_pb2.TensorList()
+        for tensor in v:
+          if str(tensor.dtype) == 'torch.bfloat16':
+            np_array = tensor.float().detach().numpy()  # Convertit BFloat16 en float32
+          else:
+            np_array = tensor.detach().numpy()
           tensor_data = node_service_pb2.Tensor(tensor_data=np_array.tobytes(), shape=list(np_array.shape), dtype=str(np_array.dtype))
           tensor_list.tensors.append(tensor_data)
         proto_inference_state.tensor_list_data[k].CopyFrom(tensor_list)
