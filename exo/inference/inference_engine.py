@@ -59,8 +59,19 @@ inference_engine_classes = {
   "dummy": "DummyInferenceEngine",
 }
 
+# Variable globale pour stocker le dernier moteur d'inférence sélectionné
+_last_selected_engine = None
 
 def get_inference_engine(inference_engine_name: str, shard_downloader: ShardDownloader):
+  global _last_selected_engine
+  
+  # Vérifier si nous avons déjà un moteur d'inférence sélectionné
+  if _last_selected_engine is not None and inference_engine_name != _last_selected_engine and inference_engine_name == "tinygrad":
+    print(f"ATTENTION: Une tentative de changer le moteur d'inférence de {_last_selected_engine} à {inference_engine_name} a été bloquée.")
+    inference_engine_name = _last_selected_engine
+  else:
+    _last_selected_engine = inference_engine_name
+    
   if DEBUG >= 2:
     print(f"get_inference_engine called with: {inference_engine_name}")
   if inference_engine_name == "mlx":
