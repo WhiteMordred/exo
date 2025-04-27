@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from typing import Optional, Tuple, Dict, List
 from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from exo.inference.inference_engine import InferenceEngine
 from exo.inference.shard import Shard
 from exo.download.shard_download import ShardDownloader
@@ -45,7 +45,13 @@ class ModelManager:
         # Charger le nouveau modèle de façon agnostique
         print(f"Loading model: {shard.model_id}")
         
-        self.model, self.tokenizer, _ = build_transformer(model_path=model_path)
+        # Correction de l'appel à build_transformer avec tous les paramètres requis
+        self.model, self.tokenizer = build_transformer(
+            model_name_or_path=model_path,
+            model_class=AutoModelForCausalLM,
+            config_class=AutoConfig if 'AutoConfig' in globals() else None,
+            tokenizer_class=AutoTokenizer
+        )
         
         # Mettre à jour le shard actuel
         self.current_shard = shard
