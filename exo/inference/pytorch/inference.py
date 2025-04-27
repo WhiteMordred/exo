@@ -11,6 +11,7 @@ from exo.inference.inference_engine import InferenceEngine
 from exo.inference.shard import Shard
 from exo.download.shard_download import ShardDownloader
 from exo import DEBUG
+import logging
 import re
 
 # Singleton pour gérer les modèles chargés
