@@ -333,8 +333,10 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
         await self.ensure_shard(shard)
         
         def infer_wrapper():
-            # Convertir numpy en torch tensor
-            input_tensor = torch.tensor(input_data).to(
+            # Convertir numpy en torch tensor avec le type explicite pour les IDs de tokens
+            # S'assurer que les données d'entrée sont traitées comme des entiers longs (Long)
+            # pour l'opération d'embedding
+            input_tensor = torch.tensor(input_data, dtype=torch.long).to(
                 "cuda" if torch.cuda.is_available() else "cpu"
             )
             
