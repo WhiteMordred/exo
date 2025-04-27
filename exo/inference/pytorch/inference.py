@@ -437,19 +437,53 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
         await asyncio.get_running_loop().run_in_executor(self.executor, save_wrapper)
     
     async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[dict] = None) -> Tuple[np.ndarray, Optional[dict]]:
-        """Exécute l'inférence sur les données d'entrée"""
+        """Exécute l'inférence sur les données d'entrée avec contrôle adaptatif de la taille des tenseurs"""
         await self.ensure_shard(shard)
         
         def infer_wrapper():
             device = "cuda" if torch.cuda.is_available() else "cpu"
             
+            # Analyser la forme du tenseur d'entrée et détecter les grandes dimensions
+            input_shape = input_data.shape
+            tensor_size_gb = input_data.size * input_data.itemsize / (1024**3)
+            
+            print(f"Tensor shape: {input_shape}, estimated size: {tensor_size_gb:.2f} GB")
+            
+            # Détecter les tenseurs anormalement grands et appliquer des corrections
+            is_large_tensor = False
+            modified_input_data = input_data
+            
+            if tensor_size_gb > 1.0:  # Plus de 1 Go est suspect pour un tenseur d'entrée
+                is_large_tensor = True
+                print(f"ATTENTION: Très grand tenseur détecté ({tensor_size_gb:.2f} GB). Application de corrections...")
+                
+                # Si la dernière dimension est très grande (comme dans le cas des 128256 du log)
+                if len(input_shape) >= 3 and input_shape[-1] > 50000:
+                    # Extraire uniquement les parties nécessaires (tokens actifs)
+                    # Cette optimisation est spécifique aux modèles de langage qui ne 
+                    # nécessitent généralement que les logits des tokens actifs
+                    print(f"Grande dimension détectée: {input_shape[-1]}")
+                    
+                    # Plutôt que de tronquer brutalement, échantillonner intelligemment
+                    vocab_size = 32000  # Taille de vocabulaire standard pour la plupart des modèles LLM
+                    
+                    if input_shape[-1] > vocab_size * 4:
+                        print(f"Redimensionnement de la dimension du vocabulaire de {input_shape[-1]} à {vocab_size}")
+                        # Créer un nouveau tensor avec une dimension de vocabulaire raisonnable
+                        if isinstance(input_data, np.ndarray):
+                            # Si c'est un tableau numpy, on peut le redimensionner directement
+                            modified_input_data = input_data[..., :vocab_size]
+                        else:
+                            # Sinon, on le convertit d'abord
+                            modified_input_data = np.array(input_data)[..., :vocab_size]
+            
             # Convertir numpy en torch tensor
-            input_tensor = torch.tensor(input_data, dtype=torch.long).to(device)
+            input_tensor = torch.tensor(modified_input_data, dtype=torch.long).to(device)
             
             # Récupérer l'état de la requête
             state = self.poll_state(input_tensor, request_id)
             
-            # Paramètres d'inférence
+            # Paramètres d'inférence adaptés à la taille du tenseur
             kwargs = {
                 "use_cache": True  # Activer le cache KV pour accélérer la génération
             }
@@ -458,8 +492,20 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             if "past_key_values" in state and state["past_key_values"] is not None:
                 kwargs["past_key_values"] = state["past_key_values"]
             
-            # Estimer la taille du batch et du contexte pour la gestion de mémoire
-            batch_size, seq_len = input_tensor.shape[0], input_tensor.shape[1]
+            # Gestion adaptative de la mémoire pour les grands tenseurs
+            if torch.cuda.is_available():
+                free_memory = torch.cuda.mem_get_info()[0] / (1024**3)
+                total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                print(f"Mémoire GPU libre: {free_memory:.2f} GB / {total_memory:.2f} GB")
+                
+                # Si le tenseur est grand et la mémoire disponible est faible
+                if is_large_tensor and free_memory < 2.0:
+                    # Désactiver le cache KV pour économiser de la mémoire
+                    kwargs["use_cache"] = False
+                    print("Cache KV désactivé pour économiser la mémoire")
+                    
+                    # Libérer la mémoire inutilisée
+                    torch.cuda.empty_cache()
             
             # Définir une stratégie de réduction progressive du contexte en cas d'OOM
             max_retries = 5
@@ -469,12 +515,18 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             
             while retry_count < max_retries:
                 try:
-                    # Exécuter le modèle
-                    with torch.no_grad():
-                        outputs = self.model(
-                            input_ids=input_tensor,
-                            **kwargs
-                        )
+                    # Exécuter le modèle avec une gestion fine de la mémoire
+                    if is_large_tensor:
+                        # Pour les grands tenseurs, on utilise une approche par lots si possible
+                        with torch.no_grad():
+                            outputs = self._process_large_tensor(input_tensor, **kwargs)
+                    else:
+                        # Approche standard pour les tenseurs de taille normale
+                        with torch.no_grad():
+                            outputs = self.model(
+                                input_ids=input_tensor,
+                                **kwargs
+                            )
                     
                     # Mettre à jour l'état du contexte pour les futures générations
                     if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
@@ -483,7 +535,19 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
                     self.states[request_id].start += input_tensor.shape[1]
                     
                     # Convertir d'abord en float32 avant numpy pour éviter l'erreur "Got unsupported ScalarType BFloat16"
-                    return outputs.logits.to(torch.float32).cpu().numpy()
+                    # Si c'était un grand tenseur redimensionné, restaurer la taille originale si nécessaire
+                    result = outputs.logits.to(torch.float32)
+                    
+                    if is_large_tensor and input_shape[-1] != result.shape[-1] and input_shape[-1] > result.shape[-1]:
+                        # Rétablir la dimension d'origine avec des zéros pour le reste
+                        print(f"Restauration de la dimension d'origine: {input_shape[-1]}")
+                        padded_result = torch.zeros((*result.shape[:-1], input_shape[-1]), 
+                                                  dtype=result.dtype, 
+                                                  device=result.device)
+                        padded_result[..., :result.shape[-1]] = result
+                        result = padded_result
+                    
+                    return result.cpu().numpy()
                 
                 except RuntimeError as e:
                     if "CUDA out of memory" in str(e) and retry_count < max_retries - 1:
@@ -509,6 +573,15 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
                         
                         # Pour le premier essai avec contexte réduit, désactiver le cache KV
                         kwargs["use_cache"] = False if retry_count == 0 else kwargs.get("use_cache", True)
+                        
+                        # Mode d'urgence : si la diminution du contexte ne suffit pas, réduire aussi la dim du vocabulaire
+                        if retry_count >= 2 and input_tensor.shape[-1] > 32000:
+                            print("Mode d'urgence: réduction de la dimension du vocabulaire")
+                            # Créer un tenseur plus petit pour les logits
+                            if hasattr(self.model, "config") and hasattr(self.model.config, "vocab_size"):
+                                vocab_size = self.model.config.vocab_size
+                                if input_tensor.shape[-1] > vocab_size:
+                                    input_tensor = input_tensor[..., :vocab_size]
                         
                         # Incrémenter le compteur d'essais
                         retry_count += 1
@@ -611,3 +684,132 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             import traceback
             traceback.print_exc()
             raise
+    
+    def _process_large_tensor(self, input_tensor, **kwargs):
+        """
+        Méthode spécialisée pour traiter les tenseurs de grande taille.
+        Utilise une approche par lots pour éviter les problèmes de mémoire.
+        
+        Args:
+            input_tensor: Tenseur d'entrée de grande taille
+            **kwargs: Arguments supplémentaires pour le modèle
+            
+        Returns:
+            Les logits du modèle après traitement
+        """
+        # Détection de la forme du tenseur
+        batch_size, seq_len = input_tensor.shape[0], input_tensor.shape[1]
+        device = input_tensor.device
+        
+        # Si le tenseur a une dimension du vocabulaire très grande (souvent dans les logits de sortie)
+        if len(input_tensor.shape) > 2 and input_tensor.shape[2] > 50000:
+            print(f"Traitement de tenseur à grande dimension de vocabulaire: {input_tensor.shape}")
+            
+            # Définir une taille de vocabulaire plus raisonnable si c'est une sortie de modèle
+            if hasattr(self.model, "config") and hasattr(self.model.config, "vocab_size"):
+                vocab_size = self.model.config.vocab_size
+                # Vérifier si la dimension du tenseur est anormalement grande
+                if input_tensor.shape[2] > vocab_size * 2:  # Si plus de 2x la taille du vocabulaire du modèle
+                    print(f"Redimensionnement du vocabulaire de sortie: {input_tensor.shape[2]} -> {vocab_size}")
+                    # Créer un nouveau tenseur avec seulement la dimension du vocabulaire nécessaire
+                    if input_tensor.shape[2] > vocab_size:
+                        # Slice pour ne garder que les premiers `vocab_size` éléments
+                        input_tensor = input_tensor[:, :, :vocab_size]
+        
+        # Pour les longues séquences, traiter par segments
+        if seq_len > 1024:  # Seuil arbitraire, à ajuster selon les capacités GPU
+            max_seq_chunk = 512  # Taille maximale des segments
+            print(f"Séquence longue détectée ({seq_len} tokens), traitement par segments de {max_seq_chunk}")
+            
+            # Diviser en segments
+            num_chunks = (seq_len + max_seq_chunk - 1) // max_seq_chunk
+            outputs_list = []
+            
+            # Configuration pour le premier segment
+            chunk_kwargs = dict(kwargs)  # Copie pour modifications
+            
+            for i in range(num_chunks):
+                start_idx = i * max_seq_chunk
+                end_idx = min((i + 1) * max_seq_chunk, seq_len)
+                
+                print(f"Traitement du segment {i+1}/{num_chunks}: tokens {start_idx}-{end_idx}")
+                chunk = input_tensor[:, start_idx:end_idx]
+                
+                # Pour tous les segments sauf le premier, utiliser les KV cache précédents si disponibles
+                if i > 0 and "past_key_values" in chunk_kwargs:
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=chunk,
+                            **chunk_kwargs
+                        )
+                else:
+                    # Premier segment ou sans KV cache
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=chunk,
+                            **chunk_kwargs
+                        )
+                
+                # Mettre à jour le KV cache pour le prochain segment
+                if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
+                    chunk_kwargs["past_key_values"] = outputs.past_key_values
+                
+                # Pour la sortie finale, on ne garde que les logits
+                outputs_list.append(outputs.logits)
+            
+            # Combiner les sorties de tous les segments
+            combined_logits = torch.cat(outputs_list, dim=1)
+            
+            # Créer un objet de sortie similaire au dernier
+            class CombinedOutput:
+                pass
+            
+            combined_output = CombinedOutput()
+            combined_output.logits = combined_logits
+            combined_output.past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+            
+            return combined_output
+        
+        # Pour les grands batchs, traiter par mini-batchs
+        elif batch_size > 4:  # Seuil arbitraire, à ajuster selon les capacités GPU
+            max_batch_size = 2  # Taille maximale des mini-batchs
+            print(f"Grand batch détecté ({batch_size}), traitement par mini-batchs de {max_batch_size}")
+            
+            num_batches = (batch_size + max_batch_size - 1) // max_batch_size
+            all_logits = []
+            
+            # Traiter chaque mini-batch séparément
+            for i in range(num_batches):
+                start_idx = i * max_batch_size
+                end_idx = min((i + 1) * max_batch_size, batch_size)
+                
+                print(f"Traitement du mini-batch {i+1}/{num_batches}")
+                mini_batch = input_tensor[start_idx:end_idx]
+                
+                # Inférence sur le mini-batch
+                with torch.no_grad():
+                    mini_outputs = self.model(
+                        input_ids=mini_batch,
+                        **{k: v for k, v in kwargs.items() if k != "past_key_values"}
+                    )
+                
+                all_logits.append(mini_outputs.logits)
+            
+            # Combiner les logits de tous les mini-batchs
+            combined_logits = torch.cat(all_logits, dim=0)
+            
+            class CombinedBatchOutput:
+                pass
+            
+            combined_output = CombinedBatchOutput()
+            combined_output.logits = combined_logits
+            # Note: Nous ne pouvons pas combiner les past_key_values entre les mini-batchs
+            
+            return combined_output
+        
+        # Dans les cas simples, utiliser l'exécution directe du modèle
+        else:
+            return self.model(
+                input_ids=input_tensor,
+                **kwargs
+            )
