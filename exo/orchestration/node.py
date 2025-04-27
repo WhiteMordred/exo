@@ -54,6 +54,7 @@ class Node:
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
+    self._loading_status = {}  # Pour suivre l'état de chargement des modèles entre nœuds
 
   async def start(self, wait_for_peers: int = 0) -> None:
     self.device_capabilities = await device_capabilities()
@@ -68,11 +69,44 @@ class Node:
     await self.discovery.stop()
     await self.server.stop()
 
+  async def broadcast_model_loading_status(self, model_id, status):
+    """Diffuse l'état de chargement d'un modèle à tous les nœuds"""
+    status_message = json.dumps({
+      "type": "model_loading_status",
+      "node_id": self.id,
+      "model_id": model_id,
+      "status": status,
+      "timestamp": time.time()
+    })
+    await self.broadcast_opaque_status("", status_message)
+
   def on_node_status(self, request_id, opaque_status):
     try:
       status_data = json.loads(opaque_status)
       status_type = status_data.get("type", "")
-      if status_type == "supported_inference_engines":
+      
+      # Gérer les notifications de chargement de modèle entre nœuds
+      if status_type == "model_loading_status":
+        node_id = status_data.get("node_id")
+        model_id = status_data.get("model_id")
+        status = status_data.get("status")
+        timestamp = status_data.get("timestamp", 0)
+        
+        # Mettre à jour notre connaissance de l'état du modèle sur d'autres nœuds
+        if node_id != self.id:  # Ignorer nos propres notifications
+          if model_id not in self._loading_status:
+            self._loading_status[model_id] = {}
+          
+          # Ne mettre à jour que si le timestamp est plus récent
+          if timestamp > self._loading_status[model_id].get("timestamp", 0):
+            print(f"Nœud {node_id} indique que le modèle {model_id} est '{status}'")
+            self._loading_status[model_id] = {
+              "status": status,
+              "node_id": node_id,
+              "timestamp": timestamp
+            }
+      
+      elif status_type == "supported_inference_engines":
         node_id = status_data.get("node_id")
         engines = status_data.get("engines", [])
         self.topology_inference_engines_pool.append(engines)
@@ -361,31 +395,46 @@ class Node:
   ) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
     start_time = time.perf_counter_ns()
-    resp = await self._process_tensor(shard, tensor, request_id, inference_state)
+    resp = await self._process_tensor(request_id, shard, tensor, inference_state)
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     if DEBUG >= 2: print(f"[{request_id}] process_tensor: {base_shard=} {shard=} {tensor.size=} {tensor.shape=} {elapsed_time_ns=}")
 
-  async def _process_tensor(
-    self,
-    base_shard: Shard,
-    tensor: np.ndarray,
-    request_id: Optional[str] = None,
-    inference_state: Optional[dict] = None,
-  ) -> Optional[np.ndarray]:
-    if request_id is None:
-      request_id = str(uuid.uuid4())
-    shard = self.get_current_shard(base_shard)
-
+  async def _process_tensor(self, request_id: str, shard: Shard, tensor: np.ndarray, inference_state: Optional[dict] = None):
+    """ Traiter un tenseur d'entrée, soit localement, soit en le transmettant à un autre nœud """
+    start = time.time()
     try:
-      self.outstanding_requests[request_id] = "processing"
-      result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, tensor, inference_state)
-      ret = await self.process_inference_result(shard, result, request_id, inference_state) 
-      return ret
+        # Vérifier si nous avons déjà chargé ce shard ou s'il est en cours de chargement par un autre nœud
+        if shard.model_id in self._loading_status:
+            loading_status = self._loading_status[shard.model_id]
+            if loading_status["status"] == "loading" and loading_status["node_id"] != self.id:
+                print(f"Le modèle {shard.model_id} est déjà en cours de chargement par le nœud {loading_status['node_id']}")
+                # Attendre un peu avant de continuer pour éviter les chargements simultanés
+                await asyncio.sleep(1.0)
+        
+        # Marquer ce shard comme étant en cours de chargement par ce nœud
+        self._loading_status[shard.model_id] = {
+            "status": "loading",
+            "node_id": self.id,
+            "timestamp": time.time()
+        }
+        
+        result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, tensor, inference_state)
+        
+        # Marquer le chargement comme terminé
+        self._loading_status[shard.model_id]["status"] = "loaded"
+        
+        return result, inference_state
+        
     except Exception as e:
-      self.outstanding_requests.pop(request_id)
-      print(f"Error processing tensor for shard {shard}: {e}")
-      traceback.print_exc()
+        # En cas d'erreur, marquer le chargement comme échoué
+        if shard.model_id in self._loading_status:
+            self._loading_status[shard.model_id]["status"] = "failed"
+            self._loading_status[shard.model_id]["error"] = str(e)
+        raise
+    finally:
+        end = time.time()
+        print(f"[{request_id}] process_tensor: base_shard={shard} shard={shard} tensor.size={tensor.size} tensor.shape={tensor.shape} elapsed_time_ns={int((end-start) * 1e9)}")
   
   async def forward_example(
     self,

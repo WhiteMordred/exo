@@ -17,6 +17,7 @@ import re
 # Singleton pour gérer les modèles chargés
 class ModelManager:
     _instance = None
+    _loading_models = {}  # Garde une trace des modèles en cours de chargement
     
     def __new__(cls):
         if cls._instance is None:
@@ -24,10 +25,69 @@ class ModelManager:
             cls._instance.model = None
             cls._instance.tokenizer = None
             cls._instance.current_shard = None
+            cls._instance.loading_complete = asyncio.Event()
+            cls._instance.loading_complete.set()  # Initialement, aucun chargement n'est en cours
         return cls._instance
     
+    async def get_model_and_tokenizer_async(self, shard: Shard, model_path: Path):
+        """Version asynchrone qui permet une meilleure coordination entre nœuds"""
+        if self.current_shard == shard and self.model is not None and self.tokenizer is not None:
+            if DEBUG >= 2: print(f"Model {shard.model_id} is already loaded, reusing")
+            return self.model, self.tokenizer
+        
+        # Si un chargement est en cours pour ce modèle, attendre qu'il se termine
+        model_id = shard.model_id
+        if model_id in ModelManager._loading_models:
+            print(f"Waiting for model {model_id} to be loaded by another process")
+            await ModelManager._loading_models[model_id].wait()
+            
+            # Vérifier si notre shard est maintenant chargé
+            if self.current_shard == shard and self.model is not None and self.tokenizer is not None:
+                return self.model, self.tokenizer
+        
+        # Marquer le modèle comme étant en cours de chargement
+        loading_event = asyncio.Event()
+        ModelManager._loading_models[model_id] = loading_event
+        
+        try:
+            # Libérer la mémoire de l'ancien modèle si nécessaire
+            if self.model is not None:
+                if torch.cuda.is_available():
+                    try:
+                        self.model = self.model.to("cpu")
+                    except Exception as e:
+                        print(f"Error moving model to CPU: {e}")
+                self.model = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Charger le nouveau modèle de façon agnostique
+            print(f"Loading model: {shard.model_id}")
+            
+            # Créer une future pour exécuter build_transformer dans un thread
+            loop = asyncio.get_running_loop()
+            self.model, self.tokenizer = await loop.run_in_executor(
+                _executor,
+                lambda: build_transformer(
+                    model_name_or_path=model_path,
+                    model_class=AutoModelForCausalLM,
+                    config_class=AutoConfig if 'AutoConfig' in globals() else None,
+                    tokenizer_class=AutoTokenizer
+                )
+            )
+            
+            # Mettre à jour le shard actuel
+            self.current_shard = shard
+            print(f"Successfully loaded model and tokenizer for {shard.model_id}")
+            
+            return self.model, self.tokenizer
+        finally:
+            # Marquer le chargement comme terminé et supprimer le verrou
+            loading_event.set()
+            ModelManager._loading_models.pop(model_id, None)
+    
     def get_model_and_tokenizer(self, shard: Shard, model_path: Path):
-        """Renvoie le modèle et le tokenizer, ne les charge qu'une seule fois pour un shard donné"""
+        """Version synchrone pour compatibilité"""
         if self.current_shard == shard and self.model is not None and self.tokenizer is not None:
             if DEBUG >= 2: print(f"Model {shard.model_id} is already loaded, reusing")
             return self.model, self.tokenizer
@@ -128,7 +188,8 @@ def make_prompt_state(inputs, model):
 def build_transformer(model_name_or_path, model_class, config_class, tokenizer_class):
     """
     Construit un modèle transformeur avec le tokenizer associé.
-    Cette version est complètement agnostique à la taille du modèle.
+    Cette version est complètement agnostique à la taille du modèle
+    et inclut des optimisations mémoire pour PyTorch.
     """
     tokenizer = tokenizer_class.from_pretrained(model_name_or_path)
     if tokenizer.pad_token_id is None:
@@ -140,6 +201,23 @@ def build_transformer(model_name_or_path, model_class, config_class, tokenizer_c
     # Obtenir les paramètres dynamiquement en fonction de la taille estimée
     model_params = get_model_params(model_name_or_path, model_size_gb)
     
+    # Configurer l'environnement PyTorch pour optimiser la mémoire
+    if torch.cuda.is_available():
+        # Activer les segments extensibles pour réduire la fragmentation mémoire
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
+        # Calculer approximativement la quantité de mémoire disponible
+        available_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU total memory: {available_memory_gb:.2f} GB")
+        
+        # Ajuster la taille du cache en fonction de la mémoire disponible
+        if available_memory_gb < 8:
+            # Pour les GPUs avec moins de 8 GB
+            torch.cuda.set_per_process_memory_fraction(0.85)  # Utiliser 85% max
+        elif available_memory_gb < 16:
+            # Pour les GPUs de taille moyenne (8-16 GB)
+            torch.cuda.set_per_process_memory_fraction(0.9)   # Utiliser 90% max
+    
     config = config_class.from_pretrained(
         model_name_or_path,
         rope_scaling=model_params.get("rope_scaling"),
@@ -149,47 +227,119 @@ def build_transformer(model_name_or_path, model_class, config_class, tokenizer_c
     max_context = model_params.get("max_context", 4096)
     
     # Log des informations détectées pour aider au débogage
-    logging.info(f"Modèle détecté de taille approximative: {model_size_gb:.2f} GB")
-    logging.info(f"Paramètres utilisés: max_context={max_context}, rope_scaling={model_params.get('rope_scaling')}")
+    print(f"Modèle détecté de taille approximative: {model_size_gb:.2f} GB")
+    print(f"Paramètres utilisés: max_context={max_context}, rope_scaling={model_params.get('rope_scaling')}")
     
-    # Charger le modèle avec les paramètres déterminés dynamiquement
-    model = model_class.from_pretrained(
-        model_name_or_path,
-        config=config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    )
+    # Optimisations pour le chargement du modèle
+    load_options = {
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
+    }
+    
+    # Pour les modèles plus grands que la VRAM disponible, utiliser des optimisations supplémentaires
+    if model_size_gb > (available_memory_gb * 0.7) and torch.cuda.is_available():
+        print(f"Modèle de grande taille détecté ({model_size_gb:.1f} GB), activation des optimisations mémoire")
+        
+        # Activer la quantification CPU<->GPU pour les grands modèles
+        load_options.update({
+            "offload_folder": "offload",
+            "low_cpu_mem_usage": True
+        })
+        
+        # Essayer d'appliquer une quantification 8 bits si le modèle est très grand
+        if model_size_gb > available_memory_gb:
+            try:
+                import bitsandbytes as bnb
+                print("Utilisation de la quantification 8 bits pour réduire l'usage mémoire")
+                load_options["load_in_8bit"] = True
+            except ImportError:
+                print("bitsandbytes non disponible, la quantification 8 bits ne sera pas utilisée")
+    
+    # Charger le modèle avec les paramètres d'optimisation
+    try:
+        model = model_class.from_pretrained(
+            model_name_or_path,
+            config=config,
+            **load_options
+        )
+        print(f"Modèle chargé avec succès avec les options: {load_options}")
+    except Exception as e:
+        print(f"Échec du chargement avec options avancées: {e}")
+        # Fallback sur les options minimales
+        model = model_class.from_pretrained(
+            model_name_or_path,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+        print("Modèle chargé avec des paramètres minimaux")
     
     return model, tokenizer
 
-def estimate_model_size(model_path: Path) -> float:
+def estimate_model_size(model_path):
     """
     Estime la taille du modèle en GB en analysant les fichiers de poids
-    ou le répertoire du modèle.
+    ou en se basant sur le nom du modèle.
+    
+    Args:
+        model_path: Chemin vers le modèle ou ID du modèle
+    
+    Returns:
+        float: Taille estimée en GB
     """
-    if not model_path.exists():
-        return 0
+    # Convertir en Path si c'est une chaîne
+    if isinstance(model_path, str):
+        model_path = Path(model_path)
+    
+    # Si le chemin existe, calculer la taille des fichiers
+    if model_path.exists():
+        size_bytes = 0
         
-    size_bytes = 0
+        # Si c'est un fichier unique
+        if model_path.is_file():
+            return model_path.stat().st_size / 1e9  # Convertir en GB
+        
+        # Pour les dossiers, vérifier les fichiers de poids (.bin, .safetensors, .pt)
+        weight_files = list(model_path.glob("**/*.bin")) + list(model_path.glob("**/*.safetensors")) + list(model_path.glob("**/*.pt"))
+        for file_path in weight_files:
+            size_bytes += file_path.stat().st_size
+        
+        # Si des fichiers de poids ont été trouvés, retourner la taille
+        if size_bytes > 0:
+            return size_bytes / 1e9  # Convertir en GB
     
-    # Si c'est un fichier unique (comme un checkpoint)
-    if model_path.is_file():
-        return model_path.stat().st_size / 1e9  # Convertir en GB
+    # Estimation basée sur le nom du modèle - chercher des indicateurs de taille
+    model_name = model_path.name.lower() if hasattr(model_path, 'name') else str(model_path).lower()
     
-    # Si c'est un répertoire (structure HF)
-    for file_path in model_path.glob("**/*.bin"):
-        size_bytes += file_path.stat().st_size
+    # Chercher des motifs comme "7b", "13b", "llama-2-7b", etc.
+    size_indicators = {
+        'instruct': 0,  # Pas un indicateur de taille
+        '70b': 70.0,
+        '65b': 65.0,
+        '34b': 34.0,
+        '30b': 30.0,
+        '13b': 13.0,
+        '7b': 7.0,
+        '3b': 3.0,
+        '2b': 2.0,
+        '1b': 1.0,
+        '0.5b': 0.5,
+        '500m': 0.5,
+        '350m': 0.35,
+        '125m': 0.125,
+    }
     
-    # Vérifier s'il y a des safetensors (format alternatif de HF)
-    safetensor_size = 0
-    for file_path in model_path.glob("**/*.safetensors"):
-        safetensor_size += file_path.stat().st_size
+    # Chercher la plus grande taille qui correspond
+    estimated_size = 0
+    for indicator, size in size_indicators.items():
+        if indicator in model_name and size > estimated_size:
+            estimated_size = size
     
-    # Utiliser le plus grand des deux formats (bin ou safetensors)
-    size_bytes = max(size_bytes, safetensor_size)
+    # Convertir les paramètres en GB approximatifs (2 bytes par paramètre en fp16)
+    if estimated_size > 0:
+        return estimated_size * 2.0
     
-    # Convertir en GB
-    return size_bytes / 1e9
+    # Par défaut, considérer comme un petit modèle (3B)
+    return 6.0  # ~3B parameters estimés à 6GB
 
 _executor = ThreadPoolExecutor(max_workers=1)  # singleton pour que PyTorch s'exécute toujours sur le même thread
 class PyTorchDynamicShardInferenceEngine(InferenceEngine):
@@ -308,51 +458,81 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             if "past_key_values" in state and state["past_key_values"] is not None:
                 kwargs["past_key_values"] = state["past_key_values"]
             
-            try:
-                # Exécuter le modèle
-                with torch.no_grad():
-                    outputs = self.model(
-                        input_ids=input_tensor,
-                        **kwargs
-                    )
-                
-                # Mettre à jour l'état du contexte pour les futures générations
-                if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
-                    self.states[request_id].cache["past_key_values"] = outputs.past_key_values
-                
-                self.states[request_id].start += input_tensor.shape[1]
-                
-                # Convertir d'abord en float32 avant numpy pour éviter l'erreur "Got unsupported ScalarType BFloat16"
-                return outputs.logits.to(torch.float32).cpu().numpy()
+            # Estimer la taille du batch et du contexte pour la gestion de mémoire
+            batch_size, seq_len = input_tensor.shape[0], input_tensor.shape[1]
             
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    print(f"CUDA OOM error: {str(e)}")
-                    
-                    # Libérer la mémoire
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # Réinitialiser l'état pour cette requête et supprimer le KV cache
-                    if request_id in self.states:
-                        del self.states[request_id]
-                    
-                    # Essayer avec un contexte plus petit
-                    reduced_context = max(128, int(input_tensor.shape[1] * 0.75))
-                    print(f"Retrying with reduced context: {reduced_context} tokens")
-                    
-                    input_tensor = input_tensor[:, -reduced_context:].to(device)
+            # Définir une stratégie de réduction progressive du contexte en cas d'OOM
+            max_retries = 5
+            retry_count = 0
+            context_reduction_factor = 0.75  # Réduire à 75% à chaque essai
+            min_context_size = 32  # Contexte minimum à préserver (tokens)
+            
+            while retry_count < max_retries:
+                try:
+                    # Exécuter le modèle
                     with torch.no_grad():
-                        outputs = self.model(input_ids=input_tensor, use_cache=False)
+                        outputs = self.model(
+                            input_ids=input_tensor,
+                            **kwargs
+                        )
                     
-                    # Recréer un état propre
-                    self.states[request_id] = make_prompt_state(input_tensor, self.model)
-                    self.states[request_id].start = reduced_context
+                    # Mettre à jour l'état du contexte pour les futures générations
+                    if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
+                        self.states[request_id].cache["past_key_values"] = outputs.past_key_values
                     
-                    # Convertir également ici en float32 avant numpy
+                    self.states[request_id].start += input_tensor.shape[1]
+                    
+                    # Convertir d'abord en float32 avant numpy pour éviter l'erreur "Got unsupported ScalarType BFloat16"
                     return outputs.logits.to(torch.float32).cpu().numpy()
-                else:
-                    raise
+                
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e) and retry_count < max_retries - 1:
+                        # Informations détaillées sur l'erreur OOM
+                        print(f"CUDA OOM error (essai {retry_count+1}/{max_retries}): {str(e)}")
+                        
+                        # Libérer la mémoire
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Réinitialiser l'état pour cette requête et supprimer le KV cache
+                        if request_id in self.states:
+                            del self.states[request_id]
+                        
+                        # Calculer la nouvelle taille de contexte pour le prochain essai
+                        current_context = input_tensor.shape[1]
+                        reduced_context = max(min_context_size, int(current_context * context_reduction_factor))
+                        
+                        print(f"Retrying with reduced context: {reduced_context} tokens (from {current_context})")
+                        
+                        # Préparer le tenseur réduit pour le prochain essai
+                        input_tensor = input_tensor[:, -reduced_context:].to(device)
+                        
+                        # Pour le premier essai avec contexte réduit, désactiver le cache KV
+                        kwargs["use_cache"] = False if retry_count == 0 else kwargs.get("use_cache", True)
+                        
+                        # Incrémenter le compteur d'essais
+                        retry_count += 1
+                    else:
+                        # Soit ce n'est pas une erreur OOM, soit nous avons atteint le nombre max de tentatives
+                        print(f"Erreur critique après {retry_count+1} tentatives: {str(e)}")
+                        raise
+            
+            # Si on arrive ici, c'est qu'on a épuisé toutes les tentatives
+            # Dernier recours : essayer avec un contexte minimal en mode dégradé
+            try:
+                print(f"Tentative finale avec contexte minimal de {min_context_size} tokens")
+                input_tensor = input_tensor[:, -min_context_size:].to(device)
+                with torch.no_grad():
+                    outputs = self.model(input_ids=input_tensor, use_cache=False)
+                
+                # Recréer un état propre
+                self.states[request_id] = make_prompt_state(input_tensor, self.model)
+                self.states[request_id].start = min_context_size
+                
+                return outputs.logits.to(torch.float32).cpu().numpy()
+            except Exception as final_error:
+                print(f"Échec de la tentative finale: {str(final_error)}")
+                raise RuntimeError(f"Impossible d'exécuter l'inférence après plusieurs tentatives: {str(final_error)}")
         
         output_data = await asyncio.get_running_loop().run_in_executor(self.executor, infer_wrapper)
         return output_data, inference_state
@@ -406,7 +586,7 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
         return await asyncio.get_running_loop().run_in_executor(self.executor, train_wrapper)
     
     async def ensure_shard(self, shard: Shard):
-        """S'assure que le bon shard du modèle est chargé"""
+        """S'assure que le bon shard du modèle est chargé en utilisant la coordination asynchrone"""
         # Vérifier si c'est déjà le modèle actuel
         if self.shard == shard and self.model is not None:
             if DEBUG >= 2: print(f"Model {shard.model_id} is already the current model, reusing")
@@ -418,8 +598,9 @@ class PyTorchDynamicShardInferenceEngine(InferenceEngine):
             print(f"Model path received: {model_path}")
             
             if self.shard != shard:
+                # Utiliser la version asynchrone pour mieux coordonner le chargement entre nœuds
                 model_manager = ModelManager()
-                self.model, self.tokenizer = model_manager.get_model_and_tokenizer(shard, model_path)
+                self.model, self.tokenizer = await model_manager.get_model_and_tokenizer_async(shard, model_path)
                 
                 # Mettre à jour le shard actuel
                 self.shard = shard
