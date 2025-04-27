@@ -560,12 +560,15 @@ class Node:
         continue
 
       try:
-        other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=5.0)
+        # Utilisons un timeout plus court pour éviter des blocages prolongés
+        other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=4.5)
         if DEBUG >= 2: print(f"Collected topology from: {peer.id()}: {other_topology}")
         next_topology.merge(peer.id(), other_topology)
+      except asyncio.TimeoutError:
+        if DEBUG >= 1: print(f"Timeout collecting topology from {peer.id()}")
       except Exception as e:
-        print(f"Error collecting topology from {peer.id()}: {e}")
-        traceback.print_exc()
+        if DEBUG >= 1: print(f"Error collecting topology from {peer.id()}: {e}")
+        if DEBUG >= 2: traceback.print_exc()
 
     next_topology.active_node_id = self.topology.active_node_id
     self.topology = next_topology

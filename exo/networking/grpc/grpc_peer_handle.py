@@ -177,17 +177,21 @@ class GRPCPeerHandle(PeerHandle):
   async def collect_topology(self, visited: set[str], max_depth: int) -> Topology:
     await self._ensure_connected()
     request = node_service_pb2.CollectTopologyRequest(visited=visited, max_depth=max_depth)
-    response = await self.stub.CollectTopology(request)
-    topology = Topology()
-    for node_id, capabilities in response.nodes.items():
-      device_capabilities = DeviceCapabilities(
-        model=capabilities.model, chip=capabilities.chip, memory=capabilities.memory, flops=DeviceFlops(fp16=capabilities.flops.fp16, fp32=capabilities.flops.fp32, int8=capabilities.flops.int8)
-      )
-      topology.update_node(node_id, device_capabilities)
-    for node_id, peer_connections in response.peer_graph.items():
-      for conn in peer_connections.connections:
-        topology.add_edge(node_id, conn.to_id, conn.description)
-    return topology
+    try:
+      response = await asyncio.wait_for(self.stub.CollectTopology(request), timeout=4.0)
+      topology = Topology()
+      for node_id, capabilities in response.nodes.items():
+        device_capabilities = DeviceCapabilities(
+          model=capabilities.model, chip=capabilities.chip, memory=capabilities.memory, flops=DeviceFlops(fp16=capabilities.flops.fp16, fp32=capabilities.flops.fp32, int8=capabilities.flops.int8)
+        )
+        topology.update_node(node_id, device_capabilities)
+      for node_id, peer_connections in response.peer_graph.items():
+        for conn in peer_connections.connections:
+          topology.add_edge(node_id, conn.to_id, conn.description)
+      return topology
+    except asyncio.TimeoutError:
+      if DEBUG >= 2: print(f"Timeout collecting topology from {self._id}@{self.address}")
+      raise
 
   async def send_result(self, request_id: str, result: List[int], is_finished: bool) -> None:
     await self._ensure_connected()
